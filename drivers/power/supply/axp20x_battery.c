@@ -81,6 +81,10 @@
 #define AXP20X_V_OFF_MASK		GENMASK(2, 0)
 #define AXP717_V_OFF_MASK		GENMASK(6, 4)
 
+#define AXP228_FULL_CAPACITY_CALIBRATE_EN BIT(5)
+#define AXP228_CAPACITY_CALIBRATE BIT(4)
+#define AXP228_CALIBRATE_MASK (BIT(4) | BIT(5))
+
 #define AXP717_BAT_VMIN_MIN_UV		2600000
 #define AXP717_BAT_VMIN_MAX_UV		3300000
 #define AXP717_BAT_VMIN_STEP		100000
@@ -118,6 +122,9 @@ struct axp20x_batt_ps {
 	struct iio_channel *batt_v;
 	/* Maximum constant charge current */
 	unsigned int max_ccc;
+	int energy_full_design;
+	int current_now;
+	int voltage_now;
 	const struct axp_data	*data;
 	bool ts_disable;
 };
@@ -368,6 +375,7 @@ static int axp20x_battery_get_prop(struct power_supply *psy,
 
 		/* IIO framework gives mA but Power Supply framework gives uA */
 		val->intval *= 1000;
+		axp20x_batt->current_now = val->intval;
 		break;
 
 	case POWER_SUPPLY_PROP_CAPACITY:
@@ -416,8 +424,64 @@ static int axp20x_battery_get_prop(struct power_supply *psy,
 
 		/* IIO framework gives mV but Power Supply framework gives uV */
 		val->intval *= 1000;
+		axp20x_batt->voltage_now = val->intval;
 		break;
 
+	case POWER_SUPPLY_PROP_ENERGY_FULL:
+	case POWER_SUPPLY_PROP_ENERGY_NOW:
+	case POWER_SUPPLY_PROP_ENERGY_FULL_DESIGN:
+		/* When no battery is present, return 0 */
+		ret = regmap_read(axp20x_batt->regmap, AXP20X_PWR_OP_MODE,
+				 &reg);
+		if (ret)
+			return ret;
+
+		if (!(reg & AXP20X_PWR_OP_BATT_PRESENT)) {
+			val->intval = 0;
+			return 0;
+		}
+
+		if (psp == POWER_SUPPLY_PROP_ENERGY_FULL) {
+			// TODO
+			val->intval = axp20x_batt->energy_full_design;
+			return 0;
+		}
+
+		if (psp == POWER_SUPPLY_PROP_ENERGY_FULL_DESIGN) {
+			val->intval = axp20x_batt->energy_full_design;
+			return 0;
+		}
+
+		ret = regmap_read(axp20x_batt->regmap, AXP20X_FG_RES, &reg);
+		if (ret)
+			return ret;
+
+		if (axp20x_batt->data->has_fg_valid && !(reg & AXP22X_FG_VALID))
+			return -EINVAL;
+
+		val1 = reg & AXP209_FG_PERCENT;
+		val1 = max(min(val1, 100), 0);
+		val->intval =
+			(val1 *
+			((long long int)axp20x_batt->energy_full_design)) /
+			100;
+		break;
+
+	case POWER_SUPPLY_PROP_CALIBRATE:
+		// report both calibrate enable flag and calibration status
+		ret = regmap_read(axp20x_batt->regmap, AXP20X_CC_CTRL, &reg);
+		if (ret)
+			return ret;
+		val1 = reg & AXP228_CALIBRATE_MASK;
+		val->intval = val1;
+		break;
+
+	case POWER_SUPPLY_PROP_POWER_NOW:
+		val->intval = (axp20x_batt->voltage_now / 10000) *
+			     axp20x_batt->current_now;
+		val->intval = val->intval / 100; // uW
+		break;
+ 
 	default:
 		return -EINVAL;
 	}
@@ -770,6 +834,7 @@ static int axp20x_battery_set_prop(struct power_supply *psy,
 				   const union power_supply_propval *val)
 {
 	struct axp20x_batt_ps *axp20x_batt = power_supply_get_drvdata(psy);
+	int val1;
 
 	switch (psp) {
 	case POWER_SUPPLY_PROP_VOLTAGE_MIN:
@@ -777,6 +842,18 @@ static int axp20x_battery_set_prop(struct power_supply *psy,
 
 	case POWER_SUPPLY_PROP_VOLTAGE_MAX:
 		return axp20x_batt->data->set_max_voltage(axp20x_batt, val->intval);
+
+	case POWER_SUPPLY_PROP_CALIBRATE:
+		if (val->intval) {
+			// enable calibrate
+			val1 = AXP228_FULL_CAPACITY_CALIBRATE_EN |
+			       AXP228_CAPACITY_CALIBRATE;
+		} else {
+			// disable calibrate
+			val1 = 0;
+		}
+		return regmap_update_bits(axp20x_batt->regmap, AXP20X_CC_CTRL,
+					  AXP228_CALIBRATE_MASK, val1);
 
 	case POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT:
 		return axp20x_set_constant_charge_current(axp20x_batt,
@@ -849,6 +926,11 @@ static enum power_supply_property axp20x_battery_props[] = {
 	POWER_SUPPLY_PROP_VOLTAGE_MAX,
 	POWER_SUPPLY_PROP_VOLTAGE_MIN,
 	POWER_SUPPLY_PROP_CAPACITY,
+	POWER_SUPPLY_PROP_ENERGY_FULL,
+	POWER_SUPPLY_PROP_ENERGY_NOW,
+	POWER_SUPPLY_PROP_ENERGY_FULL_DESIGN,
+	POWER_SUPPLY_PROP_CALIBRATE,
+	POWER_SUPPLY_PROP_POWER_NOW,
 };
 
 static enum power_supply_property axp717_battery_props[] = {
@@ -872,7 +954,8 @@ static int axp20x_battery_prop_writeable(struct power_supply *psy,
 	       psp == POWER_SUPPLY_PROP_VOLTAGE_MIN ||
 	       psp == POWER_SUPPLY_PROP_VOLTAGE_MAX ||
 	       psp == POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT ||
-	       psp == POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX;
+	       psp == POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX ||
+	       psp == POWER_SUPPLY_PROP_CALIBRATE;
 }
 
 static int axp717_battery_prop_writeable(struct power_supply *psy,
@@ -985,24 +1068,6 @@ static void axp717_set_battery_info(struct platform_device *pdev,
 	int vmax = info->voltage_max_design_uv;
 	int ccc = info->constant_charge_current_max_ua;
 	int val;
-
-	axp_batt->ts_disable = (device_property_read_bool(axp_batt->dev,
-							  "x-powers,no-thermistor"));
-
-	/*
-	 * Under rare conditions an incorrectly programmed efuse for
-	 * the temp sensor on the PMIC may trigger a fault condition.
-	 * Allow users to hard-code if the ts pin is not used to work
-	 * around this problem. Note that this requires the battery
-	 * be correctly defined in the device tree with a monitored
-	 * battery node.
-	 */
-	if (axp_batt->ts_disable) {
-		regmap_update_bits(axp_batt->regmap,
-				   AXP717_TS_PIN_CFG,
-				   AXP717_TS_PIN_DISABLE,
-				   AXP717_TS_PIN_DISABLE);
-	}
 
 	if (vmin > 0 && axp717_set_voltage_min_design(axp_batt, vmin))
 		dev_err(&pdev->dev,
@@ -1130,6 +1195,29 @@ static int axp20x_power_probe(struct platform_device *pdev)
 	if (!power_supply_get_battery_info(axp20x_batt->batt, &info)) {
 		axp20x_batt->data->set_bat_info(pdev, axp20x_batt, info);
 		power_supply_put_battery_info(axp20x_batt->batt, info);
+		axp20x_batt->energy_full_design = info->energy_full_design_uwh;
+
+		int cfd = info->charge_full_design_uah;
+
+		// tell pmic about our battery
+		if (cfd) {
+			// [14:8], [7:0], cfd = Value * 1.456mAh
+			cfd = cfd / 1456;
+			regmap_update_bits(axp20x_batt->regmap,
+					   AXP288_FG_DES_CAP0_REG, 0xff,
+					   cfd & 0xff);
+			regmap_update_bits(axp20x_batt->regmap,
+					   AXP288_FG_DES_CAP1_REG, 0xff,
+					   BIT(7) | ((cfd >> 8) & 0xff));
+		} else {
+			dev_warn(axp20x_batt->dev,
+				 "charge full design is not set");
+		}
+	} else {
+		axp20x_batt->energy_full_design = 8000000;
+		dev_warn(axp20x_batt->dev,
+			 "energy full design is not set, default to %d\n",
+			 axp20x_batt->energy_full_design);
 	}
 
 	/*
@@ -1137,6 +1225,12 @@ static int axp20x_power_probe(struct platform_device *pdev)
 	 * to current register value by default.
 	 */
 	axp20x_get_constant_charge_current(axp20x_batt, &axp20x_batt->max_ccc);
+
+	regmap_update_bits(axp20x_batt->regmap, AXP20X_VBUS_IPSOUT_MGMT, 0x03, 0x03);
+	regmap_update_bits(axp20x_batt->regmap, AXP20X_OFF_CTRL, 0x08, 0x08);
+	regmap_update_bits(axp20x_batt->regmap, AXP20X_CHRG_CTRL2, 0x30, 0x20);
+	regmap_update_bits(axp20x_batt->regmap, AXP20X_PEK_KEY, 0x0f, 0x0b);
+	regmap_update_bits(axp20x_batt->regmap, AXP20X_GPIO0_CTRL, 0x07, 0x00);
 
 	return 0;
 }
