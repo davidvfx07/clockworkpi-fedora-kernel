@@ -46,6 +46,12 @@ static int axp20x_i2c_probe(struct i2c_client *i2c)
 		return ret;
 	}
 
+	regmap_update_bits(axp20x->regmap, AXP20X_VBUS_IPSOUT_MGMT, 0x03, 0x03);
+	regmap_update_bits(axp20x->regmap, AXP20X_OFF_CTRL, 0x08, 0x08);
+	regmap_update_bits(axp20x->regmap, AXP20X_CHRG_CTRL2, 0x30, 0x20);
+	regmap_update_bits(axp20x->regmap, AXP20X_PEK_KEY, 0x0f, 0x0b);
+	regmap_update_bits(axp20x->regmap, AXP20X_GPIO0_CTRL, 0x07, 0x00);
+
 	return axp20x_device_probe(axp20x);
 }
 
